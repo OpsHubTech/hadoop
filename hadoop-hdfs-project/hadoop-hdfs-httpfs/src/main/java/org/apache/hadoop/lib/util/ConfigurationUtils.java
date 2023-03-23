@@ -69,10 +69,7 @@ public abstract class ConfigurationUtils {
    * @return a new ConfigurationUtils instance with all inline values resolved.
    */
   public static Configuration resolve(Configuration conf) {
-    Configuration resolved = new Configuration(false);
-     for (Map.Entry<String, String> entry : conf) {
-        resolved.set(entry.getKey(), conf.get(entry.getKey()));
-    }  
+   
     return resolved;
   }
 
