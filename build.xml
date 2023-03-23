@@ -209,7 +209,7 @@
 				task.perform();
 				var msg = "";
 				if( parseInt(parsedJsonResponse.cumulativeCccDetails.changedCodeCoveragePercentage,10) &lt; parseInt(project.getProperty("threshold"),10)) {
-					msg = "Merged blocked as cumulative changed code coverage for this pull request is only " + parsedJsonResponse.cumulativeCccDetails.changedCodeCoveragePercentage + "% whereas required is " +project.getProperty("threshold")+"%";
+					msg = "Merged blocked as cumulative changed code coverage for this pull request is " + parsedJsonResponse.cumulativeCccDetails.changedCodeCoveragePercentage + "% whereas required is " +project.getProperty("threshold")+"%";
 				}
 				else if(parseInt(parsedJsonResponse.cumulativeCccDetails.commitFilesBelowCCCThreshold,10) != 0 ) {
 					msg = "Merged blocked for this pull request as " + parsedJsonResponse.cumulativeCccDetails.commitFilesBelowCCCThreshold + " files are below required cumulative changed code coverage of " +project.getProperty("threshold")+"%";
