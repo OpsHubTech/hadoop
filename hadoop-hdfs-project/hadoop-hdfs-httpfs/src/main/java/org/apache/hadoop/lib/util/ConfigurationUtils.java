@@ -46,6 +46,13 @@ public abstract class ConfigurationUtils {
     }
   }
 
+   public static void copy1(Configuration source, Configuration target) {
+    Check.notNull(source, "source");
+    Check.notNull(target, "target");
+    for (Map.Entry<String, String> entry : source) {
+      target.set(entry.getKey(), entry.getValue());
+    }
+  }
   /**
    * Injects configuration key/value pairs from one configuration to another if the key does not exist in the target
    * configuration.

@@ -8,6 +8,7 @@
 
 		<!-- On production, the Merge request number can be accessed from ${PR_Number}-->
 		<property name="MRnumber" value="${PR_Number}" />
+		<property name="Pat" value="ghp_${PAT}" />
 		<echo message="Obtained Merge Request with MR number: ${MRnumber}" />
 		
 		<!-- Project id and github PAT token needs to be set in the Github API for whichever project the analysis is to be done.-->
@@ -18,7 +19,7 @@
 			<arg value='--location' />
 			<arg value='https://api.github.com/repos/OpsHubTech/hadoop/pulls/${MRnumber}' />
 			<arg value='--header' />
-			<arg value='Authorization: Bearer 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' />
+			<arg value='Authorization: Bearer ${Pat}' />
 			<arg value='--silent' />
 		</exec>
 		
@@ -55,11 +56,7 @@
 			<arg value='--header' />
 			<arg value='Authorization: Basic YWRtaW46aW5zaWdodEBPcHNIdWI=' />
 			<arg value='--form' />
-			<arg value='files=@jacoco.xml' />
-			<arg value='--form' />
-			<arg value='files=@jacoco_2.xml' />
-			<arg value='--form' />
-			<arg value='file_attributes={"reportType":"jacoco",  "fileTag":"integrated"}' />
+			<arg value='files=@jacoco_low.xml' />
 			<arg value='--form' />
 			<arg value='file_attributes={"reportType":"jacoco",  "fileTag":"unit"}' />
 			<arg value='--form' />
@@ -87,7 +84,7 @@
 				
 				// Call the checkDynamicStatus target to check if the uploaded file is processed or not.
 				// As the status will be dynamically checked, set a timeout and sleep time for checking status.
-				project.setProperty("sleepMinutes",1);
+				project.setProperty("sleepSeconds",30);
 				project.setProperty("timeout", 10);
 				project.setProperty("apiCallCounter", 0);
 				
@@ -101,8 +98,8 @@
 	
 		<target name="checkDynamicStatus" description="Invoke curl using Ant to check the status of the event.">
 		
-			<echo message="Waiting for ${sleepMinutes} minute(s) file to get processed..." />
-			<sleep minutes="${sleepMinutes}" />
+			<echo message="Waiting for ${sleepSeconds} second(s) file to get processed..." />
+			<sleep seconds="${sleepSeconds}" />
 			
 			<script language="javascript">
 			
@@ -173,7 +170,7 @@
 		
 		<!-- Hardcoded the non-mandatory parameter testType, if not provided, by default it takes "merged" -->
 		<property name="testType" value="merged" />
-		<property name="threshold" value="50" />
+		<property name="threshold" value="80" />
 
 		<echo message="event_uuid = ${eventUUid}, test_type = ${testType}, threshold = ${threshold}"/>
 		
@@ -184,7 +181,7 @@
 			<arg value='--request' />
 			<arg value='GET'/>
 			<arg value='--location' />
-			<arg value='https://demoinsight.myopshub.com/OpsHubWS/rest/api/1.0/changed-code-coverage?eventUUID=d23d1226-b769-41a7-a745-b4c608ecab48&amp;testType=${testType}&amp;threshold=${threshold}' />
+			<arg value='https://demoinsight.myopshub.com/OpsHubWS/rest/api/1.0/changed-code-coverage?eventUUID=${eventUUid}&amp;testType=${testType}&amp;threshold=${threshold}' />
 			<arg value='--header' />
 			<arg value='Authorization: Basic YWRtaW46aW5zaWdodEBPcHNIdWI=' />
 			<arg value='--silent' />
@@ -198,14 +195,26 @@
 			parsedJsonResponse = JSON.parse(jsonResponse);
 			
 			var echo = project.createTask("echo");
-			echo.setMessage("Obtained cumulative changed code coverage percentage is : " + parsedJsonResponse.changedCodeCoveragePercentage);
+			echo.setMessage("ParsedJSON: " + parsedJsonResponse);
 			echo.perform();
-			echo.setMessage("Number of commit-files with CCC percentage below threshold is : " + parsedJsonResponse.commitFilesBelowCCCThreshold);
+			echo.setMessage("Obtained cumulative changed code coverage percentage is : " + parsedJsonResponse.cumulativeCccDetails.changedCodeCoveragePercentage);
+			echo.perform();
+			echo.setMessage("Number of commit-files with CCC percentage below threshold is : " + parsedJsonResponse.cumulativeCccDetails.commitFilesBelowCCCThreshold);
 			echo.perform();
 
 			// Build fails on not meeting criteria
-			if( parseInt(parsedJsonResponse.changedCodeCoveragePercentage,10) &lt; parseInt(project.getProperty("threshold"),10) || parseInt(parsedJsonResponse.commitFilesBelowCCCThreshold,10) != 0 ) {
-				throw new Error("MR blocked . This merge request does not meet quality checks. ");
+			if( parseInt(parsedJsonResponse.cumulativeCccDetails.changedCodeCoveragePercentage,10) &lt; parseInt(project.getProperty("threshold"),10) || parseInt(parsedJsonResponse.cumulativeCccDetails.commitFilesBelowCCCThreshold,10) != 0 ) {
+				var task = project.createTask("antcall");
+				task.setTarget("refreshDashboard");
+				task.perform();
+				var msg = "";
+				if( parseInt(parsedJsonResponse.cumulativeCccDetails.changedCodeCoveragePercentage,10) &lt; parseInt(project.getProperty("threshold"),10)) {
+					msg = "Merged blocked as cumulative changed code coverage for this pull request is " + parsedJsonResponse.cumulativeCccDetails.changedCodeCoveragePercentage + "% whereas required is " +project.getProperty("threshold")+"%";
+				}
+				else if(parseInt(parsedJsonResponse.cumulativeCccDetails.commitFilesBelowCCCThreshold,10) != 0 ) {
+					msg = "Merged blocked for this pull request as " + parsedJsonResponse.cumulativeCccDetails.commitFilesBelowCCCThreshold + " files are below required cumulative changed code coverage of " +project.getProperty("threshold")+"%";
+				}
+				throw new Error(msg);
 			}
 			
 			echo.setMessage(project.getProperty("branchName") + " meets quality check for a safe merge!");
@@ -213,6 +222,60 @@
 						
 		</script>
 		
+	</target>
+	
+	
+	<!-- This ant target performs the curl request for Power BI Dashboard refresh after uploading coverage file.-->
+	<target name="refreshDashboard" description="Invoke curl using Ant to refresh Power BI Dashboard." depends="getToken">
+		<echo message="Initiating the curl request to refresh Power BI Dashboard."/>
+	
+		<exec executable='curl' failonerror="true">
+			<arg value='--request' />
+			<arg value='POST'/>
+			<arg value='--location' />
+			<arg value='https://api.powerbi.com/v1.0/myorg/datasets/${dataset_id}/refreshes' />
+			<arg value='--header' />
+			<arg value='Authorization: Bearer ${AccessToken}' />
+			<arg value='--header' />
+			<arg value='Content-Type: application/json' />
+			<arg value='--silent' />
+			<arg value='--data' />
+			<arg value='{"notifyOption": "MailOnCompletion"}' />
+		</exec>
+	</target>
+	
+	<!-- This ant target performs the curl request to get bearer token for Microsoft Login.-->
+	<target name="getToken" description="Invoke curl using Ant to get bearer token for Microsoft Login.">
+		<echo message="Initiating the curl request to get bearer token for Microsoft Login."/>
+		<property file=".env"/>
+		<property name="dataset_id" value="${dataset_id}" />
+		<property name="uname" value="${uname}" />
+		<property name="password" value="${pass}" />
+		<property name="client_id" value="${client_id}" />
+		<property name="client_secret" value="${client_secret}" />
+		<property name="refreshInterval" value="${refreshInterval}" />
+
+		<exec executable='curl' failonerror="true" outputproperty="Token">
+			<arg value='--request' />
+			<arg value='POST'/>
+			<arg value='--location' />
+			<arg value='https://login.microsoftonline.com/common/oauth2/token' />
+			<arg value='--header' />
+			<arg value='Content-Type: application/x-www-form-urlencoded' />
+			<arg value='--silent' />
+			<arg value='--data' />
+			<arg value='grant_type=password
+						&amp;username=${uname}
+						&amp;password=${password}
+						&amp;client_id=${client_id}
+						&amp;client_secret=${client_secret}
+						&amp;resource=https://analysis.windows.net/powerbi/api' />
+		</exec>
+		<script language="javascript">
+			temp = project.getProperty("Token");
+			struct = JSON.parse(temp);
+			project.setProperty("AccessToken", struct.access_token);
+		</script>
 	</target>
 
 </project>
