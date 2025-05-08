@@ -19,6 +19,7 @@
 package org.apache.hadoop.yarn.server.router.clientrm;
 
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -28,13 +29,19 @@ import java.util.List;
 import java.util.Map;
 import java.util.HashMap;
 import java.util.Set;
+import java.util.HashSet;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 import java.util.Arrays;
+import java.util.Collection;
 
+import org.apache.hadoop.io.Text;
 import org.apache.hadoop.metrics2.lib.DefaultMetricsSystem;
+import org.apache.hadoop.test.GenericTestUtils;
 import org.apache.hadoop.test.LambdaTestUtils;
 import org.apache.hadoop.util.Time;
 import org.apache.hadoop.yarn.MockApps;
+import org.apache.hadoop.yarn.api.ApplicationClientProtocol;
 import org.apache.hadoop.yarn.api.protocolrecords.GetApplicationAttemptReportRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetApplicationAttemptReportResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.GetApplicationReportRequest;
@@ -99,6 +106,12 @@ import org.apache.hadoop.yarn.api.protocolrecords.ReservationUpdateRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.ReservationUpdateResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.ReservationDeleteRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.ReservationDeleteResponse;
+import org.apache.hadoop.yarn.api.protocolrecords.GetDelegationTokenRequest;
+import org.apache.hadoop.yarn.api.protocolrecords.GetDelegationTokenResponse;
+import org.apache.hadoop.yarn.api.protocolrecords.RenewDelegationTokenRequest;
+import org.apache.hadoop.yarn.api.protocolrecords.RenewDelegationTokenResponse;
+import org.apache.hadoop.yarn.api.protocolrecords.CancelDelegationTokenRequest;
+import org.apache.hadoop.yarn.api.protocolrecords.CancelDelegationTokenResponse;
 import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
 import org.apache.hadoop.yarn.api.records.ApplicationId;
 import org.apache.hadoop.yarn.api.records.ApplicationSubmissionContext;
@@ -122,11 +135,17 @@ import org.apache.hadoop.yarn.api.records.ReservationRequest;
 import org.apache.hadoop.yarn.api.records.ReservationDefinition;
 import org.apache.hadoop.yarn.api.records.ReservationRequestInterpreter;
 import org.apache.hadoop.yarn.api.records.ReservationRequests;
+import org.apache.hadoop.yarn.api.records.Token;
+import org.apache.hadoop.yarn.api.records.ApplicationReport;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.exceptions.YarnException;
+import org.apache.hadoop.yarn.security.client.RMDelegationTokenIdentifier;
 import org.apache.hadoop.yarn.server.federation.policies.manager.UniformBroadcastPolicyManager;
 import org.apache.hadoop.yarn.server.federation.store.impl.MemoryFederationStateStore;
+import org.apache.hadoop.yarn.server.federation.store.records.RouterRMDTSecretManagerState;
+import org.apache.hadoop.yarn.server.federation.store.records.RouterStoreToken;
 import org.apache.hadoop.yarn.server.federation.store.records.SubClusterId;
+import org.apache.hadoop.yarn.server.federation.store.records.SubClusterInfo;
 import org.apache.hadoop.yarn.server.federation.utils.FederationStateStoreFacade;
 import org.apache.hadoop.yarn.server.federation.utils.FederationStateStoreTestUtil;
 import org.apache.hadoop.yarn.server.resourcemanager.MockRM;
@@ -136,6 +155,9 @@ import org.apache.hadoop.yarn.server.resourcemanager.reservation.ReservationSyst
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMApp;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppState;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptState;
+import org.apache.hadoop.yarn.server.router.security.RouterDelegationTokenSecretManager;
+import org.apache.hadoop.yarn.util.ConverterUtils;
+import org.apache.hadoop.yarn.util.Records;
 import org.apache.hadoop.yarn.util.Times;
 import org.apache.hadoop.yarn.util.resource.Resources;
 import org.junit.Assert;
@@ -168,17 +190,22 @@ public class TestFederationClientInterceptor extends BaseRouterClientRMTest {
   private final static long DEFAULT_DURATION = 10 * 60 * 1000;
 
   @Override
-  public void setUp() {
+  public void setUp() throws IOException {
     super.setUpConfig();
     interceptor = new TestableFederationClientInterceptor();
 
     stateStore = new MemoryFederationStateStore();
     stateStore.init(this.getConf());
-    FederationStateStoreFacade.getInstance().reinitialize(stateStore, getConf());
+    FederationStateStoreFacade.getInstance(getConf()).reinitialize(stateStore, getConf());
     stateStoreUtil = new FederationStateStoreTestUtil(stateStore);
 
     interceptor.setConf(this.getConf());
     interceptor.init(user);
+    RouterDelegationTokenSecretManager tokenSecretManager =
+        interceptor.createRouterRMDelegationTokenSecretManager(this.getConf());
+
+    tokenSecretManager.startThreads();
+    interceptor.setTokenSecretManager(tokenSecretManager);
 
     subClusters = new ArrayList<>();
 
@@ -228,6 +255,7 @@ public class TestFederationClientInterceptor extends BaseRouterClientRMTest {
     conf.setInt("yarn.scheduler.maximum-allocation-mb", 100 * 1024);
     conf.setInt("yarn.scheduler.maximum-allocation-vcores", 100);
 
+    conf.setBoolean("hadoop.security.authentication", true);
     return conf;
   }
 
@@ -362,6 +390,66 @@ public class TestFederationClientInterceptor extends BaseRouterClientRMTest {
     KillApplicationRequest requestKill = KillApplicationRequest.newInstance(appId);
     KillApplicationResponse responseKill = interceptor.forceKillApplication(requestKill);
     Assert.assertNotNull(responseKill);
+  }
+
+  @Test
+  public void testForceKillApplicationAllSubClusters()
+      throws IOException, YarnException, InterruptedException, TimeoutException {
+
+    // We will design a unit test. In this unit test,
+    // we will submit the same application to all sub-clusters.
+    // Then we use interceptor kill application,
+    // the application should be cleared from all sub-clusters.
+
+    Set<SubClusterId> subClusterSet = new HashSet<>();
+    for (SubClusterId subCluster : subClusters) {
+      subClusterSet.add(subCluster);
+    }
+
+    ApplicationId appId =
+        ApplicationId.newInstance(System.currentTimeMillis(), 2);
+    SubmitApplicationRequest request = mockSubmitApplicationRequest(appId);
+
+    // Submit the application we are going to kill later
+    SubmitApplicationResponse response = interceptor.submitApplication(request);
+
+    Assert.assertNotNull(response);
+    SubClusterId subClusterId = stateStoreUtil.queryApplicationHomeSC(appId);
+    Assert.assertNotNull(stateStoreUtil.queryApplicationHomeSC(appId));
+
+    subClusterSet.remove(subClusterId);
+
+    for (SubClusterId subCluster : subClusterSet) {
+      LOG.info("SubCluster : {}.", subCluster);
+      ApplicationClientProtocol clientRMProxyForSubCluster =
+          interceptor.getClientRMProxyForSubCluster(subCluster);
+      clientRMProxyForSubCluster.submitApplication(request);
+    }
+
+    KillApplicationRequest requestKill = KillApplicationRequest.newInstance(appId);
+    GenericTestUtils.waitFor(() -> {
+      KillApplicationResponse responseKill;
+      try {
+        responseKill = interceptor.forceKillApplication(requestKill);
+      } catch (Exception e) {
+        throw new RuntimeException(e);
+      }
+      return (responseKill.getIsKillCompleted());
+    }, 100, 2000);
+
+    for (SubClusterId subCluster : subClusters) {
+      ApplicationClientProtocol clientRMProxyForSubCluster =
+          interceptor.getClientRMProxyForSubCluster(subCluster);
+      GetApplicationReportRequest requestGet = GetApplicationReportRequest.newInstance(appId);
+      GetApplicationReportResponse responseGet =
+          clientRMProxyForSubCluster.getApplicationReport(requestGet);
+      Assert.assertNotNull(responseGet);
+      ApplicationReport applicationReport = responseGet.getApplicationReport();
+      Assert.assertNotNull(applicationReport);
+      YarnApplicationState yarnApplicationState = applicationReport.getYarnApplicationState();
+      Assert.assertNotNull(yarnApplicationState);
+      Assert.assertEquals(YarnApplicationState.KILLED, yarnApplicationState);
+    }
   }
 
   /**
@@ -579,12 +667,20 @@ public class TestFederationClientInterceptor extends BaseRouterClientRMTest {
     Assert.assertEquals(subClusters.size(),
         response.getClusterMetrics().getNumNodeManagers());
 
+    // Clear Membership
+    Map<SubClusterId, SubClusterInfo> membership = new HashMap<>();
+    membership.putAll(stateStore.getMembership());
+    stateStore.getMembership().clear();
+
     ClientMethod remoteMethod = new ClientMethod("getClusterMetrics",
         new Class[] {GetClusterMetricsRequest.class},
         new Object[] {GetClusterMetricsRequest.newInstance()});
-    Map<SubClusterId, GetClusterMetricsResponse> clusterMetrics = interceptor.
-        invokeConcurrent(new ArrayList<>(), remoteMethod, GetClusterMetricsResponse.class);
+    Collection<GetClusterMetricsResponse> clusterMetrics = interceptor.invokeConcurrent(
+        remoteMethod, GetClusterMetricsResponse.class);
     Assert.assertTrue(clusterMetrics.isEmpty());
+
+    // Restore membership
+    stateStore.setMembership(membership);
   }
 
   /**
@@ -1136,11 +1232,27 @@ public class TestFederationClientInterceptor extends BaseRouterClientRMTest {
 
     QueueInfo queueInfo = response.getQueueInfo();
     Assert.assertNotNull(queueInfo);
-    Assert.assertEquals(queueInfo.getQueueName(),  "root");
-    Assert.assertEquals(queueInfo.getCapacity(), 4.0, 0);
-    Assert.assertEquals(queueInfo.getCurrentCapacity(), 0.0, 0);
-    Assert.assertEquals(queueInfo.getChildQueues().size(), 12, 0);
-    Assert.assertEquals(queueInfo.getAccessibleNodeLabels().size(), 1);
+    Assert.assertEquals("root", queueInfo.getQueueName());
+    Assert.assertEquals(4.0, queueInfo.getCapacity(), 0);
+    Assert.assertEquals(0.0, queueInfo.getCurrentCapacity(), 0);
+    Assert.assertEquals(12, queueInfo.getChildQueues().size(), 0);
+    Assert.assertEquals(1, queueInfo.getAccessibleNodeLabels().size());
+  }
+
+  @Test
+  public void testSubClusterGetQueueInfo() throws IOException, YarnException {
+    // We have set up a unit test where we access queue information for subcluster1.
+    GetQueueInfoResponse response = interceptor.getQueueInfo(
+        GetQueueInfoRequest.newInstance("root", true, true, true, "1"));
+    Assert.assertNotNull(response);
+
+    QueueInfo queueInfo = response.getQueueInfo();
+    Assert.assertNotNull(queueInfo);
+    Assert.assertEquals("root", queueInfo.getQueueName());
+    Assert.assertEquals(1.0, queueInfo.getCapacity(), 0);
+    Assert.assertEquals(0.0, queueInfo.getCurrentCapacity(), 0);
+    Assert.assertEquals(3, queueInfo.getChildQueues().size(), 0);
+    Assert.assertEquals(1, queueInfo.getAccessibleNodeLabels().size());
   }
 
   @Test
@@ -1308,13 +1420,6 @@ public class TestFederationClientInterceptor extends BaseRouterClientRMTest {
     GetNewReservationResponse response = interceptor.getNewReservation(request);
     Assert.assertNotNull(response);
 
-    // allow plan follower to synchronize, manually trigger an assignment
-    Map<SubClusterId, MockRM> mockRMs = interceptor.getMockRMs();
-    for (MockRM mockRM : mockRMs.values()) {
-      ReservationSystem reservationSystem = mockRM.getReservationSystem();
-      reservationSystem.synchronizePlan("root.decided", true);
-    }
-
     // Submit Reservation
     ReservationId reservationId = response.getReservationId();
     ReservationDefinition rDefinition = createReservationDefinition(1024, 1);
@@ -1384,13 +1489,6 @@ public class TestFederationClientInterceptor extends BaseRouterClientRMTest {
     GetNewReservationResponse response = interceptor.getNewReservation(request);
     Assert.assertNotNull(response);
 
-    // allow plan follower to synchronize, manually trigger an assignment
-    Map<SubClusterId, MockRM> mockRMs = interceptor.getMockRMs();
-    for (MockRM mockRM : mockRMs.values()) {
-      ReservationSystem reservationSystem = mockRM.getReservationSystem();
-      reservationSystem.synchronizePlan("root.decided", true);
-    }
-
     // First Submit Reservation
     ReservationId reservationId = response.getReservationId();
     ReservationDefinition rDefinition = createReservationDefinition(1024, 1);
@@ -1404,10 +1502,12 @@ public class TestFederationClientInterceptor extends BaseRouterClientRMTest {
     Assert.assertNotNull(subClusterId1);
     Assert.assertTrue(subClusters.contains(subClusterId1));
 
-    // First Retry
+    // First Retry, repeat the submission
     ReservationSubmissionResponse submissionResponse1 =
         interceptor.submitReservation(rSubmissionRequest);
     Assert.assertNotNull(submissionResponse1);
+
+    // Expect reserved clusters to be consistent
     SubClusterId subClusterId2 = stateStoreUtil.queryReservationHomeSC(reservationId);
     Assert.assertNotNull(subClusterId2);
     Assert.assertEquals(subClusterId1, subClusterId2);
@@ -1521,5 +1621,176 @@ public class TestFederationClientInterceptor extends BaseRouterClientRMTest {
         .newInstance(Arrays.asList(reservationRequests), rType);
     return ReservationDefinition.newInstance(arrival, deadline,
         requests, username, "0", Priority.UNDEFINED);
+  }
+
+  @Test
+  public void testGetNumMinThreads() {
+    // If we don't configure YarnConfiguration.ROUTER_USER_CLIENT_THREAD_POOL_MINIMUM_POOL_SIZE,
+    // we expect to get 5 threads
+    int minThreads = interceptor.getNumMinThreads(this.getConf());
+    Assert.assertEquals(5, minThreads);
+
+    // If we configure YarnConfiguration.ROUTER_USER_CLIENT_THREAD_POOL_MINIMUM_POOL_SIZE,
+    // we expect to get 3 threads
+    this.getConf().unset(YarnConfiguration.ROUTER_USER_CLIENT_THREADS_SIZE);
+    this.getConf().setInt(YarnConfiguration.ROUTER_USER_CLIENT_THREAD_POOL_MINIMUM_POOL_SIZE, 3);
+    int minThreads2 = interceptor.getNumMinThreads(this.getConf());
+    Assert.assertEquals(3, minThreads2);
+  }
+
+  @Test
+  public void testGetNumMaxThreads() {
+    // If we don't configure YarnConfiguration.ROUTER_USER_CLIENT_THREAD_POOL_MAXIMUM_POOL_SIZE,
+    // we expect to get 5 threads
+    int minThreads = interceptor.getNumMaxThreads(this.getConf());
+    Assert.assertEquals(5, minThreads);
+
+    // If we configure YarnConfiguration.ROUTER_USER_CLIENT_THREAD_POOL_MAXIMUM_POOL_SIZE,
+    // we expect to get 8 threads
+    this.getConf().unset(YarnConfiguration.ROUTER_USER_CLIENT_THREADS_SIZE);
+    this.getConf().setInt(YarnConfiguration.ROUTER_USER_CLIENT_THREAD_POOL_MAXIMUM_POOL_SIZE, 8);
+    int minThreads2 = interceptor.getNumMaxThreads(this.getConf());
+    Assert.assertEquals(8, minThreads2);
+  }
+
+  @Test
+  public void testGetDelegationToken() throws IOException, YarnException {
+
+    // We design such a unit test to check
+    // that the execution of the GetDelegationToken method is as expected.
+    //
+    // 1. Apply for a DelegationToken for renewer1,
+    // the Router returns the DelegationToken of the user, and the KIND of the token is
+    // RM_DELEGATION_TOKEN
+    //
+    // 2. We maintain the compatibility with RMDelegationTokenIdentifier,
+    // we can serialize the token into RMDelegationTokenIdentifier.
+    //
+    // 3. We can get the issueDate, and compare the data in the StateStore,
+    // the data should be consistent.
+
+    // Step1. We apply for DelegationToken for renewer1
+    // Both response & delegationToken cannot be empty
+    GetDelegationTokenRequest request = mock(GetDelegationTokenRequest.class);
+    when(request.getRenewer()).thenReturn("renewer1");
+    GetDelegationTokenResponse response = interceptor.getDelegationToken(request);
+    Assert.assertNotNull(response);
+    Token delegationToken = response.getRMDelegationToken();
+    Assert.assertNotNull(delegationToken);
+    Assert.assertEquals("RM_DELEGATION_TOKEN", delegationToken.getKind());
+
+    // Step2. Serialize the returned Token as RMDelegationTokenIdentifier.
+    org.apache.hadoop.security.token.Token<RMDelegationTokenIdentifier> token =
+        ConverterUtils.convertFromYarn(delegationToken, (Text) null);
+    RMDelegationTokenIdentifier rMDelegationTokenIdentifier = token.decodeIdentifier();
+    Assert.assertNotNull(rMDelegationTokenIdentifier);
+
+    // Step3. Verify the returned data of the token.
+    String renewer = rMDelegationTokenIdentifier.getRenewer().toString();
+    long issueDate = rMDelegationTokenIdentifier.getIssueDate();
+    long maxDate = rMDelegationTokenIdentifier.getMaxDate();
+    Assert.assertEquals("renewer1", renewer);
+
+    long tokenMaxLifetime = this.getConf().getLong(
+        YarnConfiguration.RM_DELEGATION_TOKEN_MAX_LIFETIME_KEY,
+        YarnConfiguration.RM_DELEGATION_TOKEN_MAX_LIFETIME_DEFAULT);
+    Assert.assertEquals(issueDate + tokenMaxLifetime, maxDate);
+
+    RouterRMDTSecretManagerState managerState = stateStore.getRouterRMSecretManagerState();
+    Assert.assertNotNull(managerState);
+
+    Map<RMDelegationTokenIdentifier, RouterStoreToken> delegationTokenState =
+        managerState.getTokenState();
+    Assert.assertNotNull(delegationTokenState);
+    Assert.assertTrue(delegationTokenState.containsKey(rMDelegationTokenIdentifier));
+
+    long tokenRenewInterval = this.getConf().getLong(
+        YarnConfiguration.RM_DELEGATION_TOKEN_RENEW_INTERVAL_KEY,
+        YarnConfiguration.RM_DELEGATION_TOKEN_RENEW_INTERVAL_DEFAULT);
+    RouterStoreToken resultRouterStoreToken = delegationTokenState.get(rMDelegationTokenIdentifier);
+    Assert.assertNotNull(resultRouterStoreToken);
+    long renewDate = resultRouterStoreToken.getRenewDate();
+    Assert.assertEquals(issueDate + tokenRenewInterval, renewDate);
+  }
+
+  @Test
+  public void testRenewDelegationToken() throws IOException, YarnException {
+
+    // We design such a unit test to check
+    // that the execution of the GetDelegationToken method is as expected
+    // 1. Call GetDelegationToken to apply for delegationToken.
+    // 2. Call renewDelegationToken to refresh delegationToken.
+    // By looking at the code of AbstractDelegationTokenSecretManager#renewToken,
+    // we know that renewTime is calculated as Math.min(id.getMaxDate(), now + tokenRenewInterval)
+    // so renewTime will be less than or equal to maxDate.
+    // 3. We will compare whether the expirationTime returned to the
+    // client is consistent with the renewDate in the stateStore.
+
+    // Step1. Call GetDelegationToken to apply for delegationToken.
+    GetDelegationTokenRequest request = mock(GetDelegationTokenRequest.class);
+    when(request.getRenewer()).thenReturn("renewer2");
+    GetDelegationTokenResponse response = interceptor.getDelegationToken(request);
+    Assert.assertNotNull(response);
+    Token delegationToken = response.getRMDelegationToken();
+
+    org.apache.hadoop.security.token.Token<RMDelegationTokenIdentifier> token =
+        ConverterUtils.convertFromYarn(delegationToken, (Text) null);
+    RMDelegationTokenIdentifier rMDelegationTokenIdentifier = token.decodeIdentifier();
+    String renewer = rMDelegationTokenIdentifier.getRenewer().toString();
+    long maxDate = rMDelegationTokenIdentifier.getMaxDate();
+    Assert.assertEquals("renewer2", renewer);
+
+    // Step2. Call renewDelegationToken to refresh delegationToken.
+    RenewDelegationTokenRequest renewRequest = Records.newRecord(RenewDelegationTokenRequest.class);
+    renewRequest.setDelegationToken(delegationToken);
+    RenewDelegationTokenResponse renewResponse = interceptor.renewDelegationToken(renewRequest);
+    Assert.assertNotNull(renewResponse);
+
+    long expDate = renewResponse.getNextExpirationTime();
+    Assert.assertTrue(expDate <= maxDate);
+
+    // Step3. Compare whether the expirationTime returned to
+    // the client is consistent with the renewDate in the stateStore
+    RouterRMDTSecretManagerState managerState = stateStore.getRouterRMSecretManagerState();
+    Map<RMDelegationTokenIdentifier, RouterStoreToken> delegationTokenState =
+        managerState.getTokenState();
+    Assert.assertNotNull(delegationTokenState);
+    Assert.assertTrue(delegationTokenState.containsKey(rMDelegationTokenIdentifier));
+    RouterStoreToken resultRouterStoreToken = delegationTokenState.get(rMDelegationTokenIdentifier);
+    Assert.assertNotNull(resultRouterStoreToken);
+    long renewDate = resultRouterStoreToken.getRenewDate();
+    Assert.assertEquals(expDate, renewDate);
+  }
+
+  @Test
+  public void testCancelDelegationToken() throws IOException, YarnException {
+
+    // We design such a unit test to check
+    // that the execution of the CancelDelegationToken method is as expected
+    // 1. Call GetDelegationToken to apply for delegationToken.
+    // 2. Call CancelDelegationToken to cancel delegationToken.
+    // 3. Query the data in the StateStore and confirm that the Delegation has been deleted.
+
+    // Step1. Call GetDelegationToken to apply for delegationToken.
+    GetDelegationTokenRequest request = mock(GetDelegationTokenRequest.class);
+    when(request.getRenewer()).thenReturn("renewer3");
+    GetDelegationTokenResponse response = interceptor.getDelegationToken(request);
+    Assert.assertNotNull(response);
+    Token delegationToken = response.getRMDelegationToken();
+
+    // Step2. Call CancelDelegationToken to cancel delegationToken.
+    CancelDelegationTokenRequest cancelTokenRequest =
+        CancelDelegationTokenRequest.newInstance(delegationToken);
+    CancelDelegationTokenResponse cancelTokenResponse =
+        interceptor.cancelDelegationToken(cancelTokenRequest);
+    Assert.assertNotNull(cancelTokenResponse);
+
+    // Step3. Query the data in the StateStore and confirm that the Delegation has been deleted.
+    // At this point, the size of delegationTokenState should be 0.
+    RouterRMDTSecretManagerState managerState = stateStore.getRouterRMSecretManagerState();
+    Map<RMDelegationTokenIdentifier, RouterStoreToken> delegationTokenState =
+        managerState.getTokenState();
+    Assert.assertNotNull(delegationTokenState);
+    Assert.assertEquals(0, delegationTokenState.size());
   }
 }

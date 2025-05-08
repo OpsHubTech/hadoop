@@ -30,6 +30,7 @@ import org.apache.hadoop.fs.s3a.auth.delegation.EncryptionSecrets;
 
 import static org.apache.hadoop.fs.contract.ContractTestUtils.*;
 import static org.apache.hadoop.fs.s3a.Constants.S3_ENCRYPTION_ALGORITHM;
+import static org.apache.hadoop.fs.s3a.Constants.S3_ENCRYPTION_CONTEXT;
 import static org.apache.hadoop.fs.s3a.Constants.S3_ENCRYPTION_KEY;
 import static org.apache.hadoop.fs.s3a.Constants.SERVER_SIDE_ENCRYPTION_ALGORITHM;
 import static org.apache.hadoop.fs.s3a.Constants.SERVER_SIDE_ENCRYPTION_KEY;
@@ -49,6 +50,7 @@ public abstract class AbstractTestS3AEncryption extends AbstractS3ATestBase {
   @Override
   protected Configuration createConfiguration() {
     Configuration conf = super.createConfiguration();
+    skipIfEncryptionTestsDisabled(conf);
     S3ATestUtils.disableFilesystemCaching(conf);
     patchConfigurationEncryptionSettings(conf);
     return conf;
@@ -68,6 +70,7 @@ public abstract class AbstractTestS3AEncryption extends AbstractS3ATestBase {
     removeBaseAndBucketOverrides(conf,
         S3_ENCRYPTION_ALGORITHM,
         S3_ENCRYPTION_KEY,
+        S3_ENCRYPTION_CONTEXT,
         SERVER_SIDE_ENCRYPTION_ALGORITHM,
         SERVER_SIDE_ENCRYPTION_KEY);
     conf.set(S3_ENCRYPTION_ALGORITHM,
@@ -78,8 +81,16 @@ public abstract class AbstractTestS3AEncryption extends AbstractS3ATestBase {
       0, 1, 2, 3, 4, 5, 254, 255, 256, 257, 2 ^ 12 - 1
   };
 
+  /**
+   * Skips the tests if encryption is not enabled in configuration.
+   *
+   * @implNote We can use {@link #createConfiguration()} here since
+   * it does not depend on any per-bucket based configuration.
+   * Otherwise, we would need to grab the configuration from an
+   * instance of {@link S3AFileSystem}.
+   */
   protected void requireEncryptedFileSystem() {
-    skipIfEncryptionTestsDisabled(getFileSystem().getConf());
+    skipIfEncryptionTestsDisabled(createConfiguration());
   }
 
   /**
@@ -91,8 +102,8 @@ public abstract class AbstractTestS3AEncryption extends AbstractS3ATestBase {
   @Override
   public void setup() throws Exception {
     try {
-      super.setup();
       requireEncryptedFileSystem();
+      super.setup();
     } catch (AccessDeniedException e) {
       skip("Bucket does not allow " + getSSEAlgorithm() + " encryption method");
     }

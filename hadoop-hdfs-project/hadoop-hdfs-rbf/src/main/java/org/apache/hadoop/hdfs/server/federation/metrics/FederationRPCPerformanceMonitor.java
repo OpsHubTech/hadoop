@@ -29,6 +29,7 @@ import javax.management.StandardMBean;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hdfs.server.federation.router.FederationUtil;
+import org.apache.hadoop.hdfs.server.federation.resolver.FederationNamenodeServiceState;
 import org.apache.hadoop.hdfs.server.federation.router.RouterRpcMonitor;
 import org.apache.hadoop.hdfs.server.federation.router.RouterRpcServer;
 import org.apache.hadoop.hdfs.server.federation.store.StateStoreService;
@@ -51,9 +52,9 @@ public class FederationRPCPerformanceMonitor implements RouterRpcMonitor {
 
 
   /** Time for an operation to be received in the Router. */
-  private static final ThreadLocal<Long> START_TIME = new ThreadLocal<>();
+  private static final ThreadLocal<Long> START_TIME = ThreadLocal.withInitial(() -> -1L);
   /** Time for an operation to be sent to the Namenode. */
-  private static final ThreadLocal<Long> PROXY_TIME = new ThreadLocal<>();
+  private static final ThreadLocal<Long> PROXY_TIME = ThreadLocal.withInitial(() -> -1L);
 
   /** Configuration for the performance monitor. */
   private Configuration conf;
@@ -72,6 +73,7 @@ public class FederationRPCPerformanceMonitor implements RouterRpcMonitor {
   /** Thread pool for logging stats. */
   private ExecutorService executor;
 
+  public static final String CONCURRENT = "concurrent";
 
   @Override
   public void init(Configuration configuration, RouterRpcServer rpcServer,
@@ -84,10 +86,13 @@ public class FederationRPCPerformanceMonitor implements RouterRpcMonitor {
     // Create metrics
     this.metrics = FederationRPCMetrics.create(conf, server);
     for (String nameservice : FederationUtil.getAllConfiguredNS(conf)) {
-      LOG.info("Create Nameservice RPC Metrics for " + nameservice);
+      LOG.info("Create Nameservice RPC Metrics for {}", nameservice);
       this.nameserviceRPCMetricsMap.computeIfAbsent(nameservice,
           k -> NameserviceRPCMetrics.create(conf, k));
     }
+    LOG.info("Create Nameservice RPC Metrics for {}", CONCURRENT);
+    this.nameserviceRPCMetricsMap.computeIfAbsent(CONCURRENT,
+        k -> NameserviceRPCMetrics.create(conf, k));
 
     // Create thread pool
     ThreadFactory threadFactory = new ThreadFactoryBuilder()
@@ -136,6 +141,14 @@ public class FederationRPCPerformanceMonitor implements RouterRpcMonitor {
     START_TIME.set(monotonicNow());
   }
 
+  public static long getStartOpTime() {
+    return START_TIME.get();
+  }
+
+  public static void setStartOpTime(long startOpTime) {
+    START_TIME.set(startOpTime);
+  }
+
   @Override
   public long proxyOp() {
     PROXY_TIME.set(monotonicNow());
@@ -146,13 +159,22 @@ public class FederationRPCPerformanceMonitor implements RouterRpcMonitor {
     return Thread.currentThread().getId();
   }
 
+  public static long getProxyOpTime() {
+    return PROXY_TIME.get();
+  }
+
+  public static void setProxyOpTime(long proxyOpTime) {
+    PROXY_TIME.set(proxyOpTime);
+  }
+
   @Override
-  public void proxyOpComplete(boolean success, String nsId) {
+  public void proxyOpComplete(boolean success, String nsId,
+      FederationNamenodeServiceState state) {
     if (success) {
       long proxyTime = getProxyTime();
       if (proxyTime >= 0) {
-        if (metrics != null) {
-          metrics.addProxyTime(proxyTime);
+        if (metrics != null && !CONCURRENT.equals(nsId)) {
+          metrics.addProxyTime(proxyTime, state);
         }
         if (nameserviceRPCMetricsMap != null &&
             nameserviceRPCMetricsMap.containsKey(nsId)) {
@@ -181,6 +203,25 @@ public class FederationRPCPerformanceMonitor implements RouterRpcMonitor {
     if (nameserviceRPCMetricsMap != null &&
         nameserviceRPCMetricsMap.containsKey(nsId)) {
       nameserviceRPCMetricsMap.get(nsId).incrProxyOpFailureCommunicate();
+    }
+  }
+
+  @Override
+  public void proxyOpPermitRejected(String nsId) {
+    if (metrics != null) {
+      metrics.incrProxyOpPermitRejected();
+    }
+    if (nameserviceRPCMetricsMap != null &&
+        nameserviceRPCMetricsMap.containsKey(nsId)) {
+      nameserviceRPCMetricsMap.get(nsId).incrProxyOpPermitRejected();
+    }
+  }
+
+  @Override
+  public void proxyOpPermitAccepted(String nsId) {
+    if (nameserviceRPCMetricsMap != null &&
+        nameserviceRPCMetricsMap.containsKey(nsId)) {
+      nameserviceRPCMetricsMap.get(nsId).incrProxyOpPermitAccepted();
     }
   }
 

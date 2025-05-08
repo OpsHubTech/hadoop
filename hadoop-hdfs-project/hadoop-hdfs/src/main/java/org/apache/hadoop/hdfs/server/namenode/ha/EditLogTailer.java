@@ -53,6 +53,7 @@ import org.apache.hadoop.hdfs.server.namenode.FSImage;
 import org.apache.hadoop.hdfs.server.namenode.FSNamesystem;
 import org.apache.hadoop.hdfs.server.namenode.NameNode;
 import org.apache.hadoop.hdfs.server.protocol.NamenodeProtocol;
+import org.apache.hadoop.hdfs.util.RwLockMode;
 import org.apache.hadoop.ipc.RPC;
 import org.apache.hadoop.security.SecurityUtil;
 
@@ -123,7 +124,7 @@ public class EditLogTailer {
 
   /**
    * The timeout in milliseconds of calling rollEdits RPC to Active NN.
-   * @see HDFS-4176.
+   * See HDFS-4176.
    */
   private final long rollEditsTimeoutMs;
 
@@ -311,7 +312,8 @@ public class EditLogTailer {
                 startTime - lastLoadTimeMs);
             // It is already under the name system lock and the checkpointer
             // thread is already stopped. No need to acquire any other lock.
-            editsTailed = doTailEdits();
+            // HDFS-16689. Disable inProgress to use the streaming mechanism
+            editsTailed = doTailEdits(false);
           } catch (InterruptedException e) {
             throw new IOException(e);
           } finally {
@@ -323,9 +325,13 @@ public class EditLogTailer {
       }
     });
   }
-  
+
   @VisibleForTesting
   public long doTailEdits() throws IOException, InterruptedException {
+    return doTailEdits(inProgressOk);
+  }
+
+  private long doTailEdits(boolean enableInProgress) throws IOException, InterruptedException {
     Collection<EditLogInputStream> streams;
     FSImage image = namesystem.getFSImage();
 
@@ -334,7 +340,7 @@ public class EditLogTailer {
     long startTime = timer.monotonicNow();
     try {
       streams = editLog.selectInputStreams(lastTxnId + 1, 0,
-          null, inProgressOk, true);
+          null, enableInProgress, true);
     } catch (IOException ioe) {
       // This is acceptable. If we try to tail edits in the middle of an edits
       // log roll, i.e. the last one has been finalized but the new inprogress
@@ -350,7 +356,7 @@ public class EditLogTailer {
     // transitionToActive RPC takes the write lock before calling
     // tailer.stop() -- so if we're not interruptible, it will
     // deadlock.
-    namesystem.writeLockInterruptibly();
+    namesystem.writeLockInterruptibly(RwLockMode.GLOBAL);
     try {
       long currentLastTxnId = image.getLastAppliedTxId();
       if (lastTxnId != currentLastTxnId) {
@@ -381,7 +387,7 @@ public class EditLogTailer {
       lastLoadedTxnId = image.getLastAppliedTxId();
       return editsLoaded;
     } finally {
-      namesystem.writeUnlock("doTailEdits");
+      namesystem.writeUnlock(RwLockMode.GLOBAL, "doTailEdits");
     }
   }
 
@@ -607,8 +613,15 @@ public class EditLogTailer {
     private NamenodeProtocol getActiveNodeProxy() throws IOException {
       if (cachedActiveProxy == null) {
         while (true) {
+          // If the thread is interrupted, quit by returning null.
+          if (Thread.currentThread().isInterrupted()) {
+            LOG.warn("Interrupted while trying to getActiveNodeProxy.");
+            return null;
+          }
+
           // if we have reached the max loop count, quit by returning null
           if ((nnLoopCount / nnCount) >= maxRetries) {
+            LOG.warn("Have reached the max loop count ({}).", nnLoopCount);
             return null;
           }
 
@@ -632,5 +645,25 @@ public class EditLogTailer {
       assert cachedActiveProxy != null;
       return cachedActiveProxy;
     }
+  }
+
+  @VisibleForTesting
+  public NamenodeProtocol getCachedActiveProxy() {
+    return cachedActiveProxy;
+  }
+
+  @VisibleForTesting
+  public long getLastRollTimeMs() {
+    return lastRollTimeMs;
+  }
+
+  @VisibleForTesting
+  public RemoteNameNodeInfo getCurrentNN() {
+    return currentNN;
+  }
+
+  @VisibleForTesting
+  public void setShouldRunForTest(boolean shouldRun) {
+    this.tailerThread.setShouldRun(shouldRun);
   }
 }

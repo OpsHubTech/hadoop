@@ -21,6 +21,7 @@ package org.apache.hadoop.fs.s3a.commit;
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -39,6 +40,7 @@ import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.s3a.S3AFileSystem;
 import org.apache.hadoop.fs.s3a.auth.ProgressCounter;
+import org.apache.hadoop.fs.s3a.commit.files.UploadEtag;
 import org.apache.hadoop.fs.s3a.commit.files.SinglePendingCommit;
 import org.apache.hadoop.fs.s3a.commit.impl.CommitContext;
 import org.apache.hadoop.fs.s3a.commit.impl.CommitOperations;
@@ -207,7 +209,7 @@ public class ITestCommitOperations extends AbstractCommitITest {
    */
   private static Path makeMagic(Path destFile) {
     return new Path(destFile.getParent(),
-        MAGIC + '/' + destFile.getName());
+        MAGIC_PATH_PREFIX + JOB_ID + '/' + destFile.getName());
   }
 
   @Test
@@ -279,7 +281,7 @@ public class ITestCommitOperations extends AbstractCommitITest {
     S3AFileSystem fs = getFileSystem();
     Path destDir = methodSubPath("testBaseRelativePath");
     fs.delete(destDir, true);
-    Path pendingBaseDir = new Path(destDir, MAGIC + "/child/" + BASE);
+    Path pendingBaseDir = new Path(destDir, MAGIC_PATH_PREFIX + JOB_ID + "/child/" + BASE);
     String child = "subdir/child.txt";
     Path pendingChildPath = new Path(pendingBaseDir, child);
     Path expectedDestPath = new Path(destDir, child);
@@ -334,7 +336,7 @@ public class ITestCommitOperations extends AbstractCommitITest {
 
   /**
    * Create a file through the magic commit mechanism.
-   * @param filename file to create (with __magic path.)
+   * @param filename file to create (with "MAGIC PATH".)
    * @param data data to write
    * @throws Exception failure
    */
@@ -441,11 +443,11 @@ public class ITestCommitOperations extends AbstractCommitITest {
     Assertions.assertThat(persisted.getSaved())
         .describedAs("saved timestamp in %s", persisted)
         .isGreaterThan(0);
-    List<String> etags = persisted.getEtags();
-    Assertions.assertThat(etags)
+    List<UploadEtag> uploadEtags = persisted.getEtags();
+    Assertions.assertThat(uploadEtags)
         .describedAs("Etag list")
         .hasSize(1);
-    Assertions.assertThat(CommitOperations.toPartEtags(etags))
+    Assertions.assertThat(uploadEtags)
         .describedAs("Etags to parts")
         .hasSize(1);
     return pendingDataPath;
@@ -495,7 +497,7 @@ public class ITestCommitOperations extends AbstractCommitITest {
   public void testUploadSmallFile() throws Throwable {
     File tempFile = File.createTempFile("commit", ".txt");
     String text = "hello, world";
-    FileUtils.write(tempFile, text, "UTF-8");
+    FileUtils.write(tempFile, text, StandardCharsets.UTF_8);
     CommitOperations actions = newCommitOperations();
     Path dest = methodSubPath("testUploadSmallFile");
     S3AFileSystem fs = getFileSystem();
@@ -619,8 +621,10 @@ public class ITestCommitOperations extends AbstractCommitITest {
       commits.add(commit1);
     }
 
-    assertPathDoesNotExist("destination dir", destDir);
-    assertPathDoesNotExist("subdirectory", subdir);
+    if (!isS3ExpressStorage(fs)) {
+      assertPathDoesNotExist("destination dir", destDir);
+      assertPathDoesNotExist("subdirectory", subdir);
+    }
     LOG.info("Initiating commit operations");
     try (CommitContext commitContext
              = actions.createCommitContextForTesting(destDir, JOB_ID, 0)) {

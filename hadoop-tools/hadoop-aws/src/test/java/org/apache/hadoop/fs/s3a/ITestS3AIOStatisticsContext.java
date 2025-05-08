@@ -42,6 +42,8 @@ import org.apache.hadoop.util.functional.TaskPool;
 import static org.apache.hadoop.fs.contract.ContractTestUtils.assertCapabilities;
 import static org.apache.hadoop.fs.contract.ContractTestUtils.dataset;
 import static org.apache.hadoop.fs.contract.ContractTestUtils.writeDataset;
+import static org.apache.hadoop.fs.s3a.S3ATestUtils.disablePrefetching;
+import static org.apache.hadoop.fs.s3a.S3ATestUtils.skipIfAnalyticsAcceleratorEnabled;
 import static org.apache.hadoop.fs.statistics.IOStatisticAssertions.assertThatStatisticCounter;
 import static org.apache.hadoop.fs.statistics.IOStatisticAssertions.verifyStatisticCounterValue;
 import static org.apache.hadoop.fs.statistics.StreamStatisticNames.STREAM_READ_BYTES;
@@ -67,6 +69,7 @@ public class ITestS3AIOStatisticsContext extends AbstractS3ATestBase {
   @Override
   protected Configuration createConfiguration() {
     Configuration configuration = super.createConfiguration();
+    disablePrefetching(configuration);
     enableIOStatisticsContext();
     return configuration;
   }
@@ -75,6 +78,11 @@ public class ITestS3AIOStatisticsContext extends AbstractS3ATestBase {
   public void setup() throws Exception {
     super.setup();
     executor = HadoopExecutors.newFixedThreadPool(SMALL_THREADS);
+    // Analytics accelerator currently does not support IOStatisticsContext, this will be added as
+    // part of https://issues.apache.org/jira/browse/HADOOP-19364
+    skipIfAnalyticsAcceleratorEnabled(getConfiguration(),
+        "Analytics Accelerator currently does not support IOStatisticsContext");
+
   }
 
   @Override
@@ -253,6 +261,7 @@ public class ITestS3AIOStatisticsContext extends AbstractS3ATestBase {
     // Worker thread work and wait for it to finish.
     TestWorkerThread workerThread = new TestWorkerThread(path, null);
     long workerThreadID = workerThread.getId();
+    LOG.info("Worker thread ID: {} ", workerThreadID);
     workerThread.start();
     workerThread.join();
 
@@ -463,6 +472,8 @@ public class ITestS3AIOStatisticsContext extends AbstractS3ATestBase {
 
     @Override
     public void run() {
+      // Setting the worker thread's name.
+      Thread.currentThread().setName("worker thread");
       S3AFileSystem fs = getFileSystem();
       byte[] data = new byte[BYTES_SMALL];
 
@@ -470,6 +481,9 @@ public class ITestS3AIOStatisticsContext extends AbstractS3ATestBase {
       if (ioStatisticsContext != null) {
         IOStatisticsContext.setThreadIOStatisticsContext(ioStatisticsContext);
       }
+      // Storing context in a field to not lose the reference in a GC.
+      IOStatisticsContext ioStatisticsContextWorkerThread =
+          getCurrentIOStatisticsContext();
 
       // Write in the worker thread.
       try (FSDataOutputStream out = fs.create(workerThreadPath)) {

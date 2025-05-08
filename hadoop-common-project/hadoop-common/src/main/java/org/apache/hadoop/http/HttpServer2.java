@@ -56,9 +56,11 @@ import javax.servlet.http.HttpServletRequestWrapper;
 import javax.servlet.http.HttpServletResponse;
 
 import org.apache.hadoop.classification.VisibleForTesting;
+import org.apache.hadoop.jmx.JMXJsonServletNaNFiltered;
 import org.apache.hadoop.util.Preconditions;
 import org.apache.hadoop.thirdparty.com.google.common.collect.ImmutableMap;
-import com.sun.jersey.spi.container.servlet.ServletContainer;
+import org.glassfish.jersey.server.ResourceConfig;
+import org.glassfish.jersey.servlet.ServletContainer;
 import org.apache.hadoop.HadoopIllegalArgumentException;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
@@ -117,6 +119,9 @@ import org.eclipse.jetty.webapp.WebAppContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.JMX_NAN_FILTER;
+import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.JMX_NAN_FILTER_DEFAULT;
+
 /**
  * Create a Jetty embedded server to answer http requests. The primary goal is
  * to serve up status information for the server. There are three contexts:
@@ -144,7 +149,7 @@ public final class HttpServer2 implements FilterContainer {
 
   public static final String HTTP_SOCKET_BACKLOG_SIZE_KEY =
       "hadoop.http.socket.backlog.size";
-  public static final int HTTP_SOCKET_BACKLOG_SIZE_DEFAULT = 128;
+  public static final int HTTP_SOCKET_BACKLOG_SIZE_DEFAULT = 500;
   public static final String HTTP_MAX_THREADS_KEY = "hadoop.http.max.threads";
   public static final String HTTP_ACCEPTOR_COUNT_KEY =
       "hadoop.http.acceptor.count";
@@ -248,6 +253,7 @@ public final class HttpServer2 implements FilterContainer {
         new ArrayList<>(Collections.singletonList(
             "hadoop.http.authentication."));
     private String excludeCiphers;
+    private String includeCiphers;
 
     private boolean xFrameEnabled;
     private XFrameOption xFrameOption = XFrameOption.SAMEORIGIN;
@@ -395,6 +401,11 @@ public final class HttpServer2 implements FilterContainer {
       return this;
     }
 
+    public Builder includeCiphers(String pIncludeCiphers) {
+      this.includeCiphers = pIncludeCiphers;
+      return this;
+    }
+
     /**
      * Adds the ability to control X_FRAME_OPTIONS on HttpServer2.
      * @param xFrameEnabled - True enables X_FRAME_OPTIONS false disables it.
@@ -476,6 +487,7 @@ public final class HttpServer2 implements FilterContainer {
       trustStoreType = sslConf.get(SSLFactory.SSL_SERVER_TRUSTSTORE_TYPE,
           SSLFactory.SSL_SERVER_TRUSTSTORE_TYPE_DEFAULT);
       excludeCiphers = sslConf.get(SSLFactory.SSL_SERVER_EXCLUDE_CIPHER_LIST);
+      includeCiphers = sslConf.get(SSLFactory.SSL_SERVER_INCLUDE_CIPHER_LIST);
     }
 
     public HttpServer2 build() throws IOException {
@@ -497,7 +509,12 @@ public final class HttpServer2 implements FilterContainer {
               prefix -> this.conf.get(prefix + "type")
                   .equals(PseudoAuthenticationHandler.TYPE))
       ) {
-        server.initSpnego(conf, hostName, usernameConfKey, keytabConfKey);
+        server.initSpnego(
+            conf,
+            hostName,
+            getFilterProperties(conf, authFilterConfigurationPrefixes),
+            usernameConfKey,
+            keytabConfKey);
       }
 
       for (URI ep : endpoints) {
@@ -598,10 +615,17 @@ public final class HttpServer2 implements FilterContainer {
           sslContextFactory.setTrustStorePassword(trustStorePassword);
         }
       }
-      if(null != excludeCiphers && !excludeCiphers.isEmpty()) {
+
+      if (StringUtils.hasLength(excludeCiphers)) {
         sslContextFactory.setExcludeCipherSuites(
             StringUtils.getTrimmedStrings(excludeCiphers));
-        LOG.info("Excluded Cipher List:" + excludeCiphers);
+        LOG.info("Excluded Cipher List:{}", excludeCiphers);
+      }
+
+      if (StringUtils.hasLength(includeCiphers)) {
+        sslContextFactory.setIncludeCipherSuites(
+          StringUtils.getTrimmedStrings(includeCiphers));
+        LOG.info("Included Cipher List:{}", includeCiphers);
       }
 
       setEnabledProtocols(sslContextFactory);
@@ -780,7 +804,7 @@ public final class HttpServer2 implements FilterContainer {
       }
     }
 
-    addDefaultServlets();
+    addDefaultServlets(conf);
     addPrometheusServlet(conf);
     addAsyncProfilerServlet(contexts, conf);
   }
@@ -971,12 +995,17 @@ public final class HttpServer2 implements FilterContainer {
 
   /**
    * Add default servlets.
+   * @param configuration the hadoop configuration
    */
-  protected void addDefaultServlets() {
+  protected void addDefaultServlets(Configuration configuration) {
     // set up default servlets
     addServlet("stacks", "/stacks", StackServlet.class);
     addServlet("logLevel", "/logLevel", LogLevel.Servlet.class);
-    addServlet("jmx", "/jmx", JMXJsonServlet.class);
+    addServlet("jmx", "/jmx",
+        configuration.getBoolean(JMX_NAN_FILTER, JMX_NAN_FILTER_DEFAULT)
+            ? JMXJsonServletNaNFiltered.class
+            : JMXJsonServlet.class
+    );
     addServlet("conf", "/conf", ConfServlet.class);
   }
 
@@ -1003,8 +1032,7 @@ public final class HttpServer2 implements FilterContainer {
    */
   public void addJerseyResourcePackage(final String packageName,
       final String pathSpec) {
-    addJerseyResourcePackage(packageName, pathSpec,
-        Collections.<String, String>emptyMap());
+    addJerseyResourcePackage(packageName, pathSpec, Collections.emptyMap());
   }
 
   /**
@@ -1015,14 +1043,30 @@ public final class HttpServer2 implements FilterContainer {
    */
   public void addJerseyResourcePackage(final String packageName,
       final String pathSpec, Map<String, String> params) {
-    LOG.info("addJerseyResourcePackage: packageName=" + packageName
-        + ", pathSpec=" + pathSpec);
-    final ServletHolder sh = new ServletHolder(ServletContainer.class);
-    sh.setInitParameter("com.sun.jersey.config.property.resourceConfigClass",
-        "com.sun.jersey.api.core.PackagesResourceConfig");
-    sh.setInitParameter("com.sun.jersey.config.property.packages", packageName);
+    LOG.info("addJerseyResourcePackage: packageName = {}, pathSpec = {}.",
+        packageName, pathSpec);
+    final ResourceConfig config = new ResourceConfig().packages(packageName);
+    final ServletHolder sh = new ServletHolder(new ServletContainer(config));
     for (Map.Entry<String, String> entry : params.entrySet()) {
       sh.setInitParameter(entry.getKey(), entry.getValue());
+    }
+    webAppContext.addServlet(sh, pathSpec);
+  }
+
+  /**
+   * Add a Jersey resource config.
+   * @param config The Jersey ResourceConfig to be registered.
+   * @param pathSpec The path spec for the servlet
+   * @param params properties and features for ResourceConfig
+   */
+  public void addJerseyResourceConfig(final ResourceConfig config,
+      final String pathSpec, Map<String, String> params) {
+    LOG.info("addJerseyResourceConfig: pathSpec = {}.", pathSpec);
+    final ServletHolder sh = new ServletHolder(new ServletContainer(config));
+    if (params != null) {
+      for (Map.Entry<String, String> entry : params.entrySet()) {
+        sh.setInitParameter(entry.getKey(), entry.getValue());
+      }
     }
     webAppContext.addServlet(sh, pathSpec);
   }
@@ -1340,8 +1384,12 @@ public final class HttpServer2 implements FilterContainer {
   }
 
   private void initSpnego(Configuration conf, String hostName,
-      String usernameConfKey, String keytabConfKey) throws IOException {
+      Properties authFilterConfigurationPrefixes, String usernameConfKey, String keytabConfKey)
+      throws IOException {
     Map<String, String> params = new HashMap<>();
+    for (Map.Entry<Object, Object> entry : authFilterConfigurationPrefixes.entrySet()) {
+      params.put(String.valueOf(entry.getKey()), String.valueOf(entry.getValue()));
+    }
     String principalInConf = conf.get(usernameConfKey);
     if (principalInConf != null && !principalInConf.isEmpty()) {
       params.put("kerberos.principal", SecurityUtil.getServerPrincipal(
@@ -1967,4 +2015,8 @@ public final class HttpServer2 implements FilterContainer {
     return metrics;
   }
 
+  @VisibleForTesting
+  List<ServerConnector> getListeners() {
+    return listeners;
+  }
 }

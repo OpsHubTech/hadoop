@@ -33,6 +33,7 @@ import static org.junit.Assert.fail;
 import java.io.IOException;
 import java.util.concurrent.ThreadLocalRandom;
 
+import org.apache.hadoop.fs.CommonPathCapabilities;
 import org.apache.hadoop.hdfs.server.blockmanagement.BlockManagerTestUtil;
 import org.apache.hadoop.hdfs.server.datanode.DataNodeFaultInjector;
 import org.apache.hadoop.ipc.RemoteException;
@@ -47,6 +48,7 @@ import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.FsShell;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.SafeModeAction;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.hdfs.AppendTestUtil;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
@@ -56,7 +58,6 @@ import org.apache.hadoop.hdfs.HdfsConfiguration;
 import org.apache.hadoop.hdfs.MiniDFSCluster;
 import org.apache.hadoop.hdfs.protocol.Block;
 import org.apache.hadoop.hdfs.protocol.HdfsConstants;
-import org.apache.hadoop.hdfs.protocol.HdfsConstants.SafeModeAction;
 import org.apache.hadoop.hdfs.protocol.LocatedBlock;
 import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
 import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfoContiguous;
@@ -64,6 +65,7 @@ import org.apache.hadoop.hdfs.server.common.HdfsServerConstants;
 import org.apache.hadoop.hdfs.server.common.HdfsServerConstants.StartupOption;
 import org.apache.hadoop.hdfs.server.datanode.FsDatasetTestUtils;
 import org.apache.hadoop.hdfs.server.namenode.FSDirectory.DirOp;
+import org.apache.hadoop.hdfs.util.RwLockMode;
 import org.apache.hadoop.hdfs.tools.DFSAdmin;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.test.GenericTestUtils;
@@ -143,6 +145,8 @@ public class TestFileTruncate {
         writeContents(contents, fileLength, p);
 
         int newLength = fileLength - toTruncate;
+        assertTrue("DFS supports truncate",
+            fs.hasPathCapability(p, CommonPathCapabilities.FS_TRUNCATE));
         boolean isReady = fs.truncate(p, newLength);
         LOG.info("fileLength=" + fileLength + ", newLength=" + newLength
             + ", toTruncate=" + toTruncate + ", isReady=" + isReady);
@@ -176,6 +180,8 @@ public class TestFileTruncate {
 
     for(int n = data.length; n > 0; ) {
       final int newLength = ThreadLocalRandom.current().nextInt(n);
+      assertTrue("DFS supports truncate",
+          fs.hasPathCapability(p, CommonPathCapabilities.FS_TRUNCATE));
       final boolean isReady = fs.truncate(p, newLength);
       LOG.info("newLength=" + newLength + ", isReady=" + isReady);
       assertEquals("File must be closed for truncating at the block boundary",
@@ -209,6 +215,8 @@ public class TestFileTruncate {
     final int newLength = data.length - 1;
     assert newLength % BLOCK_SIZE != 0 :
         " newLength must not be multiple of BLOCK_SIZE";
+    assertTrue("DFS supports truncate",
+        fs.hasPathCapability(p, CommonPathCapabilities.FS_TRUNCATE));
     final boolean isReady = fs.truncate(p, newLength);
     LOG.info("newLength=" + newLength + ", isReady=" + isReady);
     assertEquals("File must be closed for truncating at the block boundary",
@@ -947,9 +955,9 @@ public class TestFileTruncate {
   @Test
   public void testTruncateEditLogLoad() throws IOException {
     // purge previously accumulated edits
-    fs.setSafeMode(SafeModeAction.SAFEMODE_ENTER);
+    fs.setSafeMode(SafeModeAction.ENTER);
     fs.saveNamespace();
-    fs.setSafeMode(SafeModeAction.SAFEMODE_LEAVE);
+    fs.setSafeMode(SafeModeAction.LEAVE);
 
     int startingFileSize = 2 * BLOCK_SIZE + BLOCK_SIZE / 2;
     int toTruncate = 1;
@@ -1045,7 +1053,7 @@ public class TestFileTruncate {
     assertFileLength(snapshotFile, startingFileSize);
 
     // empty edits and restart
-    fs.setSafeMode(SafeModeAction.SAFEMODE_ENTER);
+    fs.setSafeMode(SafeModeAction.ENTER);
     fs.saveNamespace();
     cluster.restartNameNode(true);
     assertThat("Total block count should be unchanged from start-up",
@@ -1076,7 +1084,7 @@ public class TestFileTruncate {
     INodeFile file = iip.getLastINode().asFile();
     long initialGenStamp = file.getLastBlock().getGenerationStamp();
     // Test that prepareFileForTruncate sets up in-place truncate.
-    fsn.writeLock();
+    fsn.writeLock(RwLockMode.GLOBAL);
     try {
       Block oldBlock = file.getLastBlock();
       Block truncateBlock = FSDirTruncateOp.prepareFileForTruncate(fsn, iip,
@@ -1096,7 +1104,7 @@ public class TestFileTruncate {
       fsn.getEditLog().logTruncate(
           src, client, clientMachine, BLOCK_SIZE-1, Time.now(), truncateBlock);
     } finally {
-      fsn.writeUnlock();
+      fsn.writeUnlock(RwLockMode.GLOBAL, "testTruncateRecovery");
     }
 
     // Re-create file and ensure we are ready to copy on truncate
@@ -1110,7 +1118,7 @@ public class TestFileTruncate {
         (BlockInfoContiguous) file.getLastBlock()), is(true));
     initialGenStamp = file.getLastBlock().getGenerationStamp();
     // Test that prepareFileForTruncate sets up copy-on-write truncate
-    fsn.writeLock();
+    fsn.writeLock(RwLockMode.GLOBAL);
     try {
       Block oldBlock = file.getLastBlock();
       Block truncateBlock = FSDirTruncateOp.prepareFileForTruncate(fsn, iip,
@@ -1130,7 +1138,7 @@ public class TestFileTruncate {
       fsn.getEditLog().logTruncate(
           src, client, clientMachine, BLOCK_SIZE-1, Time.now(), truncateBlock);
     } finally {
-      fsn.writeUnlock();
+      fsn.writeUnlock(RwLockMode.GLOBAL, "testTruncateRecovery");
     }
     checkBlockRecovery(srcPath);
     fs.deleteSnapshot(parent, "ss0");
@@ -1240,10 +1248,10 @@ public class TestFileTruncate {
     final DFSAdmin dfsadmin = new DFSAdmin(cluster.getConfiguration(0));
     DistributedFileSystem dfs = cluster.getFileSystem();
     //start rolling upgrade
-    dfs.setSafeMode(SafeModeAction.SAFEMODE_ENTER);
+    dfs.setSafeMode(SafeModeAction.ENTER);
     int status = dfsadmin.run(new String[]{"-rollingUpgrade", "prepare"});
     assertEquals("could not prepare for rolling upgrade", 0, status);
-    dfs.setSafeMode(SafeModeAction.SAFEMODE_LEAVE);
+    dfs.setSafeMode(SafeModeAction.LEAVE);
 
     Path dir = new Path("/testTruncateWithRollingUpgrade");
     fs.mkdirs(dir);

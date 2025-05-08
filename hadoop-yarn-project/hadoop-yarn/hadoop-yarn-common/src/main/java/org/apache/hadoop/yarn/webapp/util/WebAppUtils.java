@@ -25,6 +25,7 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
 import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
@@ -49,6 +50,7 @@ import org.apache.http.NameValuePair;
 import org.apache.http.client.utils.URLEncodedUtils;
 
 import javax.servlet.http.HttpServletRequest;
+import javax.ws.rs.container.ContainerRequestContext;
 
 @Private
 @Evolving
@@ -95,6 +97,13 @@ public class WebAppUtils {
    * Runs a certain function against the active RM. The function's first
    * argument is expected to be a string which contains the address of
    * the RM being tried.
+   * @param conf configuration.
+   * @param func throwing bi function.
+   * @param arg T arg.
+   * @param <T> Generic T.
+   * @param <R> Generic R.
+   * @throws Exception exception occurs.
+   * @return instance of Generic R.
    */
   public static <T, R> R execOnActiveRM(Configuration conf,
       ThrowingBiFunction<String, T, R> func, T arg) throws Exception {
@@ -173,6 +182,16 @@ public class WebAppUtils {
     } else {
       return conf.get(YarnConfiguration.ROUTER_WEBAPP_ADDRESS,
           YarnConfiguration.DEFAULT_ROUTER_WEBAPP_ADDRESS);
+    }
+  }
+
+  public static String getGPGWebAppURLWithoutScheme(Configuration conf) {
+    if (YarnConfiguration.useHttps(conf)) {
+      return conf.get(YarnConfiguration.GPG_WEBAPP_HTTPS_ADDRESS,
+          YarnConfiguration.DEFAULT_GPG_WEBAPP_HTTPS_ADDRESS);
+    } else {
+      return conf.get(YarnConfiguration.GPG_WEBAPP_ADDRESS,
+          YarnConfiguration.DEFAULT_GPG_WEBAPP_ADDRESS);
     }
   }
 
@@ -389,7 +408,7 @@ public class WebAppUtils {
    * if url has scheme then it will be returned as it is else it will return
    * url with scheme.
    * @param schemePrefix eg. http:// or https://
-   * @param url
+   * @param url url.
    * @return url with scheme
    */
   public static String getURLWithScheme(String schemePrefix, String url) {
@@ -428,7 +447,8 @@ public class WebAppUtils {
   /**
    * Choose which scheme (HTTP or HTTPS) to use when generating a URL based on
    * the configuration.
-   * 
+   *
+   * @param conf configuration.
    * @return the scheme (HTTP / HTTPS)
    */
   public static String getHttpSchemePrefix(Configuration conf) {
@@ -438,6 +458,8 @@ public class WebAppUtils {
   /**
    * Load the SSL keystore / truststore into the HttpServer builder.
    * @param builder the HttpServer2.Builder to populate with ssl config
+   * @return HttpServer2.Builder instance (passed in as the first parameter)
+   *         after loading SSL stores
    */
   public static HttpServer2.Builder loadSslConfiguration(
       HttpServer2.Builder builder) {
@@ -472,7 +494,9 @@ public class WebAppUtils {
             getPassword(sslConf, WEB_APP_TRUSTSTORE_PASSWORD_KEY),
             sslConf.get("ssl.server.truststore.type", "jks"))
         .excludeCiphers(
-            sslConf.get("ssl.server.exclude.cipher.list"));
+            sslConf.get("ssl.server.exclude.cipher.list"))
+        .includeCiphers(
+            sslConf.get("ssl.server.include.cipher.list"));
   }
 
   /**
@@ -573,6 +597,20 @@ public class WebAppUtils {
       List<NameValuePair> params = URLEncodedUtils.parse(queryString,
           encoding);
       return params;
+    }
+    return null;
+  }
+
+  /**
+   * Get a query string.
+   * @param request ContainerRequestContext with the request details
+   * @return the query parameter string
+   */
+  public static List<NameValuePair> getURLEncodedQueryParam(
+      ContainerRequestContext request) {
+    String queryString = request.getUriInfo().getPath();
+    if (queryString != null && !queryString.isEmpty()) {
+      return URLEncodedUtils.parse(queryString, StandardCharsets.ISO_8859_1);
     }
     return null;
   }

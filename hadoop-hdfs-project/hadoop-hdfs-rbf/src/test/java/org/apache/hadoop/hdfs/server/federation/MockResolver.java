@@ -23,6 +23,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
@@ -100,6 +101,7 @@ public class MockResolver
     final RemoteLocation remoteLocation =
         new RemoteLocation(nsId, location, mount);
     if (locationsList != null) {
+      locations.remove(mount);
       return locationsList.remove(remoteLocation);
     }
     return false;
@@ -119,12 +121,24 @@ public class MockResolver
     disableRegistration = isDisable;
   }
 
+  @Override public void updateUnavailableNamenode(String ns,
+      InetSocketAddress failedAddress) throws IOException {
+    updateNameNodeState(ns, failedAddress,
+        FederationNamenodeServiceState.UNAVAILABLE);
+  }
+
   @Override
   public void updateActiveNamenode(
       String nsId, InetSocketAddress successfulAddress) {
+    updateNameNodeState(nsId, successfulAddress,
+        FederationNamenodeServiceState.ACTIVE);
+  }
 
-    String address = successfulAddress.getHostName() + ":" +
-        successfulAddress.getPort();
+  private void updateNameNodeState(String nsId,
+      InetSocketAddress iAddr,
+      FederationNamenodeServiceState state) {
+    String sAddress = iAddr.getHostName() + ":" +
+        iAddr.getPort();
     String key = nsId;
     if (key != null) {
       // Update the active entry
@@ -132,9 +146,9 @@ public class MockResolver
       List<FederationNamenodeContext> namenodes =
           (List<FederationNamenodeContext>) this.resolver.get(key);
       for (FederationNamenodeContext namenode : namenodes) {
-        if (namenode.getRpcAddress().equals(address)) {
+        if (namenode.getRpcAddress().equals(sAddress)) {
           MockNamenodeContext nn = (MockNamenodeContext) namenode;
-          nn.setState(FederationNamenodeServiceState.ACTIVE);
+          nn.setState(state);
           break;
         }
       }
@@ -147,14 +161,39 @@ public class MockResolver
 
   @Override
   public synchronized List<? extends FederationNamenodeContext>
-      getNamenodesForNameserviceId(String nameserviceId) {
+      getNamenodesForNameserviceId(String nameserviceId, boolean observerRead) {
     // Return a copy of the list because it is updated periodically
     List<? extends FederationNamenodeContext> namenodes =
         this.resolver.get(nameserviceId);
     if (namenodes == null) {
       namenodes = new ArrayList<>();
     }
-    return Collections.unmodifiableList(new ArrayList<>(namenodes));
+
+    List<FederationNamenodeContext> ret = new ArrayList<>();
+
+    if (observerRead) {
+      Iterator<? extends FederationNamenodeContext> iterator = namenodes
+          .iterator();
+      List<FederationNamenodeContext> observerNN = new ArrayList<>();
+      List<FederationNamenodeContext> nonObserverNN = new ArrayList<>();
+      while (iterator.hasNext()) {
+        FederationNamenodeContext membership = iterator.next();
+        if (membership.getState() == FederationNamenodeServiceState.OBSERVER) {
+          observerNN.add(membership);
+        } else {
+          nonObserverNN.add(membership);
+        }
+      }
+      Collections.shuffle(observerNN);
+      Collections.sort(nonObserverNN, new NamenodePriorityComparator());
+      ret.addAll(observerNN);
+      ret.addAll(nonObserverNN);
+    } else {
+      ret.addAll(namenodes);
+      Collections.sort(ret, new NamenodePriorityComparator());
+    }
+
+    return Collections.unmodifiableList(ret);
   }
 
   @Override
@@ -298,7 +337,14 @@ public class MockResolver
   @Override
   public synchronized Set<FederationNamespaceInfo> getNamespaces()
       throws IOException {
-    return Collections.unmodifiableSet(this.namespaces);
+    Set<FederationNamespaceInfo> ret = new TreeSet<>();
+    Set<String> disabled = getDisabledNamespaces();
+    for (FederationNamespaceInfo ns : namespaces) {
+      if (!disabled.contains(ns.getNameserviceId())) {
+        ret.add(ns);
+      }
+    }
+    return Collections.unmodifiableSet(ret);
   }
 
   public void clearDisableNamespaces() {
@@ -357,6 +403,11 @@ public class MockResolver
 
   @Override
   public void setRouterId(String router) {
+  }
+
+  @Override
+  public void rotateCache(
+      String nsId, FederationNamenodeContext namenode, boolean listObserversFirst) {
   }
 
   /**
