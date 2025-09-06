@@ -69,9 +69,9 @@ public abstract class ConfigurationUtils {
    * @return a new ConfigurationUtils instance with all inline values resolved.
    */
   public static Configuration resolve(Configuration conf) {
-    Configuration resolved = new Configuration(true);
-      for (Map.Entry<String, String> entry1 : conf) {
-         resolved.set(entry1.getKey(), conf.get(entry1.getKey()));
+    Configuration resolved = new Configuration(false);
+      for (Map.Entry<String, String> entry : conf) {
+         resolved.set(entry.getKey(), conf.get(entry.getKey()));
     }  
     return resolved;
   }
